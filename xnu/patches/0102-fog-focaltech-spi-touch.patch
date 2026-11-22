@@ -1,0 +1,238 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 35debbc..f6d1562 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1024,6 +1024,197 @@ touch_fog_report(void)
+ 	return 0;
+ }
+ 
++/* ---------------------------------------------------------------------
++ * FocalTech FT8006S ("fts_ts") over the same SE0 GENI SPI.
++ *
++ * fog/rain ship two digitizer variants on the identical wiring (reset GPIO
++ * 86, IRQ GPIO 80, 9.6 MHz, 720x1650) and the same DT node, whose
++ * compatible list is "novatek,NVT-ts-spi", "focaltech,fts": the Novatek
++ * driver probes first and gives up with "Unknow Touch" on the FocalTech
++ * parts, then the vendor fts_ts driver binds.  Only the protocol differs,
++ * so the SE0 transport above is reused verbatim and the chip is detected
++ * by its ID register.
++ *
++ * Framing, from drivers/input/touchscreen/ft8006s_spi/focaltech_spi.c:
++ *   tx[0] = register, tx[1] = command, tx[2..3] = big-endian length,
++ *   three dummy bytes, then the payload.  Reads use command 0xA0
++ *   (0x80 | CRC) and append a CRC-16/KERMIT of the payload, little endian;
++ *   writes use 0x00 and carry no CRC.  One full-duplex transfer per
++ *   command: CS stays asserted for the whole message.  rx[3] & 0xA0 must
++ *   be clear, which is the chip's own status byte.
++ * ------------------------------------------------------------------- */
++#define FTS_REG_TOUCH   0x01u   /* point block: [count][10 x 6 bytes] */
++#define FTS_REG_CHIP_ID 0xa3u
++#define FTS_REG_FW_VER  0xa6u
++#define FTS_REG_POWER   0xa5u
++#define FTS_POWER_ON    0x00u
++#define FTS_CMD_READ    0xa0u   /* 0x80 | DATA_CRC_EN */
++#define FTS_CMD_WRITE   0x00u
++#define FTS_DUMMY       3u      /* vendor SPI_DUMMY_BYTE */
++#define FTS_OFF         7u      /* 4 header bytes + 3 dummy */
++#define FTS_ONE_TCH     6u
++#define FTS_POINTS      10u
++#define FTS_DATA_LEN    (FTS_POINTS * FTS_ONE_TCH + 3u)   /* 63 */
++#define FTS_MAX_ID      0x0au
++#define FTS_STATUS_MASK 0xa0u
++
++static int (*fog_report_fn)(void);
++
++static uint16_t
++touch_fog_fts_crc(const uint8_t *p, unsigned n)
++{
++	uint16_t crc = 0xffffu;
++
++	for (unsigned i = 0; i < n; ++i) {
++		crc ^= p[i];
++		for (unsigned j = 0; j < 8; ++j) {
++			crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) :
++			    (uint16_t)(crc >> 1);
++		}
++	}
++	return crc;
++}
++
++static int
++touch_fog_fts_read(uint8_t addr, uint8_t *buf, unsigned n)
++{
++	uint8_t tx[96], rx[96];
++	unsigned len = 4u + FTS_DUMMY + n + 2u;
++	uint16_t want, have;
++	int err;
++
++	if (n == 0 || len > sizeof(tx)) {
++		return EINVAL;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	tx[0] = addr;
++	tx[1] = FTS_CMD_READ;
++	tx[2] = (uint8_t)(n >> 8);
++	tx[3] = (uint8_t)n;
++	err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
++	if (err) {
++		return err;
++	}
++	if (rx[3] & FTS_STATUS_MASK) {
++		return EIO;
++	}
++	memcpy(buf, rx + FTS_OFF, n);
++	want = (uint16_t)rx[FTS_OFF + n] |
++	    ((uint16_t)rx[FTS_OFF + n + 1u] << 8);
++	have = touch_fog_fts_crc(buf, n);
++	if (want != have) {
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++touch_fog_fts_write(uint8_t addr, const uint8_t *data, unsigned n)
++{
++	uint8_t tx[96], rx[96];
++	unsigned len = 4u + FTS_DUMMY + n;
++	int err;
++
++	if (len > sizeof(tx)) {
++		return EINVAL;
++	}
++	memset(tx, 0, sizeof(tx));
++	memset(rx, 0, sizeof(rx));
++	tx[0] = addr;
++	tx[1] = FTS_CMD_WRITE;
++	tx[2] = (uint8_t)(n >> 8);
++	tx[3] = (uint8_t)n;
++	if (n) {
++		memcpy(tx + FTS_OFF, data, n);
++	}
++	err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
++	if (err) {
++		return err;
++	}
++	return (rx[3] & FTS_STATUS_MASK) ? EIO : 0;
++}
++
++/* Chip IDs seen on this family: FT8006S 0x54/0x64, FT3418 0x54, and the
++ * two IC serials the vendor tree maps (0x1e, 0x22).  Anything else is left
++ * to the Novatek path. */
++static bool
++touch_fog_fts_probe(void)
++{
++	uint8_t id = 0, fw = 0, on = FTS_POWER_ON;
++	int e1, e2, e3;
++
++	e1 = touch_fog_fts_read(FTS_REG_CHIP_ID, &id, 1);
++	e2 = e1 ? e1 : touch_fog_fts_read(FTS_REG_FW_VER, &fw, 1);
++	printf("SWEET TOUCH: fog fts chipid=%02x err=%d fw=%02x err=%d\n",
++	    id, e1, fw, e2);
++	if (e1 || e2) {
++		return false;
++	}
++	if (id != 0x1eu && id != 0x22u && id != 0x54u && id != 0x64u) {
++		printf("SWEET TOUCH: fog fts chipid %02x is not focaltech\n", id);
++		return false;
++	}
++	e3 = touch_fog_fts_write(FTS_REG_POWER, &on, 1);
++	printf("SWEET TOUCH: fog fts active err=%d fw=%02x\n", e3, fw);
++	return true;
++}
++
++/* Point block: count in buf[1] (register 0x02), then ten 6-byte records.
++ * x = ((p[2] & 0x0f) << 8) | p[3], y = ((p[4] & 0x0f) << 8) | p[5],
++ * event = p[2] >> 6 (0 down, 1 up, 2 contact), id = p[4] >> 4. */
++static int
++touch_fog_fts_report(void)
++{
++	uint8_t buf[FTS_DATA_LEN];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	unsigned points, n = 0;
++	int err;
++
++	err = touch_fog_fts_read(FTS_REG_TOUCH, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++	points = buf[1] & 0x0fu;
++	if (!st.s_frames || points) {
++		memcpy(st.s_raw, buf, sizeof(st.s_raw));
++	}
++	st.s_frames++;
++	for (unsigned i = 0; i < FTS_POINTS; ++i) {
++		unsigned base = FTS_ONE_TCH * i;
++		unsigned id = buf[4u + base] >> 4;
++		unsigned ev = buf[2u + base] >> 6;
++		unsigned px, py;
++
++		if (id >= FTS_MAX_ID) {
++			break;
++		}
++		if (ev == 1u) {   /* lifted */
++			continue;
++		}
++		px = ((unsigned)(buf[2u + base] & 0x0fu) << 8) |
++		    buf[3u + base];
++		py = ((unsigned)(buf[4u + base] & 0x0fu) << 8) |
++		    buf[5u + base];
++		if (px >= FOG_PANEL_W) {
++			px = FOG_PANEL_W - 1u;
++		}
++		if (py >= FOG_PANEL_H) {
++			py = FOG_PANEL_H - 1u;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++		n++;
++	}
++	if (n > st.s_maxn) {
++		st.s_maxn = n;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
+ static bool
+ touch_fog_se_init(void)
+ {
+@@ -1173,14 +1364,23 @@ touch_fog_run(void)
+ 	touch_wait(250);
+ 	st.stage = "fog probe";
+ 	st.probing = true;
+-	(void)touch_fog_fwinfo();
++	/* Both fog digitizer variants answer on this wiring; pick by chip ID.
++	 * The FocalTech part never answers the Novatek page/FWINFO probe, so
++	 * trying it first is the only way to tell them apart. */
++	if (touch_fog_fts_probe()) {
++		fog_report_fn = touch_fog_fts_report;
++	} else {
++		(void)touch_fog_fwinfo();
++		fog_report_fn = touch_fog_report;
++	}
+ 	st.probing = false;
+ 	if (st.dead) {
+ 		return;
+ 	}
+ 	st.stage = "fog polling";
+-	printf("SWEET TOUCH: fog novatek polling page=%#x poll=10ms irq-hint=%d\n",
+-	    fog_nvt_page, st.irq_hint);
++	printf("SWEET TOUCH: fog polling driver=%s poll=10ms irq-hint=%d\n",
++	    (fog_report_fn == touch_fog_fts_report) ? "focaltech" : "novatek",
++	    st.irq_hint);
+ 	unsigned errors = 0, ticks = 0, polls = 0;
+ 	while (!st.dead) {
+ 		if (st.diag == 3 && ++polls % 500u == 0) {
+@@ -1200,7 +1400,7 @@ touch_fog_run(void)
+ 		if (!st.irq_hint || st.active ||
+ 		    !(touch_rd(st.west, TOUCH_GPIO_IO(FOG_PIN_IRQ)) & 1u) ||
+ 		    (++ticks % 10u) == 0) {
+-			int err = touch_fog_report();
++			int err = fog_report_fn();
+ 			if (err) {
+ 				st.s_errs++;
+ 				st.s_lasterr = err;
