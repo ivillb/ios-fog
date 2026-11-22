@@ -1,5 +1,54 @@
 # ios-fog (fog/rain/wind) port — scaffolding + verified hardware, 2026-10-22
 
+## 2026-11-22 — XNU boots on this unit; FocalTech driver written (`0102`)
+
+**Status: `0102` is written and validated locally, waiting for a kernel build.
+Nothing has been flashed; every boot so far was a temporary `fastboot boot`.**
+
+- **This unit is `rain`, not `fog`** (model 220333QNY, Android 16
+  `BP4A.251205.006`, bootloader unlocked, KernelSU root). It is the same
+  hardware family as the reference unit, so the `FOG_*` constants hold.
+- **XNU boots here** (2026-11-22, RAM diagnostic, `rd=md0`, no writes):
+  shim → `SPES FB 720x1650 stride 2880 @ 0x5c000000` → `1/1 CPUs` →
+  `SWEET AMFI/WDT/HID` → `BSD root: md0` → `*** SWEET userspace: init running
+  as PID 1 ***` with the 5 s heartbeat advancing. Panel is `c3q_43_03_0b`
+  (reference: `c3q_35_02_0a`), same resolution and splash.
+- **SE0 GENI SPI transport works**: `sweettouch=1` prints
+  `fog spi op=1/2 ... err=0 status=0x41` on this unit, i.e. clocks, SE0 init,
+  pin mux and framing all work. Only the *protocol* was wrong.
+- **The digitizer is FocalTech**, not Novatek: `fts_ts` on `spi0.0`, fw
+  `focaltech_ts_fw_xinli.bin`. Ground truth read from the running Android
+  driver (`/sys/bus/spi/devices/spi0.0/fts_driver_info`):
+  `IC ID:0x8642`, `Resolution:(0,0)~(719,1649)`, `Max Touchs:10`,
+  `reset gpio:1253,int gpio:1247,irq:210`, `BUS:SPI,mode:0,max_freq:9600000`.
+  So 0xA3 = 0x86 (not the 0x54/0x64 the FT8006S datasheets suggest) and the
+  chip runs in SPI mode 0, which is what `touch_fog_se_init()` programs.
+- **`0102-fog-focaltech-spi-touch.patch`** (commit `5835aef`) reuses the SE0
+  transport verbatim and adds the FTS protocol, taken from
+  `ardia-kun/kernel_xiaomi_fog@swordx/kernelsu:drivers/input/touchscreen/ft8006s_spi`:
+  one full-duplex transfer per command (`CS_TOGGLE` already cleared),
+  `tx[0]` = register, `tx[1]` = `0x00` write / `0xA0` read, `tx[2..3]` =
+  big-endian length, three dummy bytes, payload, then CRC-16/KERMIT (init
+  `0xFFFF`, reflected `0x8408`) little endian for reads. Status byte `rx[3]`
+  must have bits 7 and 5 clear. Probe = successful 0xA3 read (the CRC is the
+  detection; the ID is only logged). Point block at 0x01: count in
+  `payload[1] & 0x0f`, ten 6-byte records at `payload[2]`, x =
+  `((r[0] & 0x0f) << 8) | r[1]`, y = `((r[2] & 0x0f) << 8) | r[3]`, id =
+  `r[2] >> 4`, event = `r[0] >> 6` (0 down, 1 up, 2 contact).
+- **Validation done without a kernel build**: `git apply --check` against a
+  real xnu-8796.121.2 tree with `0100`+`0101` applied, host `gcc -fsyntax-only`,
+  and a host unit test that mocks the SPI transfers and checks probe accept /
+  reject (bad CRC, bad status), single- and two-finger coordinates, the
+  all-lifted mask and the 0xEF reboot marker. All pass.
+- **Blocker**: XNU only builds on macOS/Xcode 15. The `xnu` workflow is
+  `workflow_dispatch`-able but needs a fork with this patch; the MacBook
+  (`macbook-air-de-ivan`, `100.72.3.64`) was used for this project before and
+  is the faster route if it still has Xcode 15.
+- **Next concrete action**: build the kernel from `5835aef`, rebuild
+  `rain-diagnostic.img` (`FOG_TOUCH=1`), `fastboot boot` it and expect
+  `fog fts chipid=86 fw=0e err=0`, `fog fts active err=0`,
+  `fog polling driver=focaltech`, then `fog frames=...` while touching.
+
 ## 2026-10-25 (night) — SE0 is GPI-preferred; the FIFO gate was wrong
 
 **Status: the driver now gets past SE0 init; next boot exercises pins/FWINFO and
