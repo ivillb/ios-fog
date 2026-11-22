@@ -2,7 +2,8 @@
 
 ## 2026-11-22 — XNU boots on this unit; FocalTech driver written (`0102`)
 
-**Status: `0102` is written and validated locally, waiting for a kernel build.
+**Status: `0102` (FocalTech) and `0103` (Xcode 16 IORPC) are in, the kernel
+builds on CI and the touch-enabled diagnostic image is waiting for its boot.
 Nothing has been flashed; every boot so far was a temporary `fastboot boot`.**
 
 - **This unit is `rain`, not `fog`** (model 220333QNY, Android 16
@@ -40,12 +41,25 @@ Nothing has been flashed; every boot so far was a temporary `fastboot boot`.**
   and a host unit test that mocks the SPI transfers and checks probe accept /
   reject (bad CRC, bad status), single- and two-finger coordinates, the
   all-lifted mask and the 0xEF reboot marker. All pass.
-- **Blocker**: XNU only builds on macOS/Xcode 15. The `xnu` workflow is
-  `workflow_dispatch`-able but needs a fork with this patch; the MacBook
-  (`macbook-air-de-ivan`, `100.72.3.64`) was used for this project before and
-  is the faster route if it still has Xcode 15.
-- **Next concrete action**: build the kernel from `5835aef`, rebuild
-  `rain-diagnostic.img` (`FOG_TOUCH=1`), `fastboot boot` it and expect
+- **Build**: GitHub Actions on `macos-15`, run **`44974659002`** (8m23s, success).
+  Two separate blockers had to go first:
+  1. the arm64 `macos-14` pool now rejects the label outright
+     (`The configuration 'macos-14-arm64-us-default' is not supported`), and
+     `macos-13` sits queued forever, so the old pin is unusable;
+  2. `macos-15` only ships Xcode 16.x/26.x, whose `iig` emits dispatch stubs
+     that read `IORPC.kernelContent`, a field xnu-8796 predates.
+  **`0103-sweet-iorpc-kernelcontent.patch`** (after `ios-sapphire` 0141) adds
+  the field kernel-only and fills it in `IOUserServer` where the kernel builds
+  an IORPC from a user message, so the ABI actually used is unchanged.
+  `tools/build-xnu-macos.sh` runs the same steps locally and is now valid on
+  Xcode 16+ too.
+  - `kernel.development.sweet` 17,827,008 B, sha256
+    `9cf1b1f55bd496c74c12749f4162da19e8459724621093bab572d0f3a708165a`
+    (Mach-O arm64, `SWEET TOUCH: fog fts` strings present).
+  - `shim/out/rain-diagnostic.img` (`FOG_DEVICE=rain FOG_TOUCH=1`, real FDT)
+    17,440,768 B, sha256
+    `d4d475db380f20078ee7cc06728c02113e1791191fcfea6b29d77eadd2e1fa3a`.
+- **Next concrete action**: `fastboot boot` that image and expect
   `fog fts chipid=86 fw=0e err=0`, `fog fts active err=0`,
   `fog polling driver=focaltech`, then `fog frames=...` while touching.
 
