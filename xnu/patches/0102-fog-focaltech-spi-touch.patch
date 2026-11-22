@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 35debbc..f6d1562 100644
+index 35debbc..7c8dc57 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -1024,6 +1024,197 @@ touch_fog_report(void)
+@@ -1024,6 +1024,223 @@ touch_fog_report(void)
  	return 0;
  }
  
@@ -39,6 +39,7 @@ index 35debbc..f6d1562 100644
 +#define FTS_DATA_LEN    (FTS_POINTS * FTS_ONE_TCH + 3u)   /* 63 */
 +#define FTS_MAX_ID      0x0au
 +#define FTS_STATUS_MASK 0xa0u
++#define FTS_RETRIES     3u      /* vendor SPI_RETRY_NUMBER */
 +
 +static int (*fog_report_fn)(void);
 +
@@ -62,33 +63,43 @@ index 35debbc..f6d1562 100644
 +{
 +	uint8_t tx[96], rx[96];
 +	unsigned len = 4u + FTS_DUMMY + n + 2u;
-+	uint16_t want, have;
-+	int err;
++	int err = EIO;
 +
 +	if (n == 0 || len > sizeof(tx)) {
 +		return EINVAL;
 +	}
 +	memset(tx, 0, sizeof(tx));
-+	memset(rx, 0, sizeof(rx));
 +	tx[0] = addr;
 +	tx[1] = FTS_CMD_READ;
 +	tx[2] = (uint8_t)(n >> 8);
 +	tx[3] = (uint8_t)n;
-+	err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
-+	if (err) {
-+		return err;
++	/* The vendor driver retries SPI_RETRY_NUMBER times: a frame can be
++	 * dropped right after reset and the status/CRC check catches it. */
++	for (unsigned i = 0; i < FTS_RETRIES; ++i) {
++		uint16_t want, have;
++
++		memset(rx, 0, sizeof(rx));
++		err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
++		if (err) {
++			touch_wait(1);
++			continue;
++		}
++		if (rx[3] & FTS_STATUS_MASK) {
++			err = EIO;
++			touch_wait(1);
++			continue;
++		}
++		memcpy(buf, rx + FTS_OFF, n);
++		want = (uint16_t)rx[FTS_OFF + n] |
++		    ((uint16_t)rx[FTS_OFF + n + 1u] << 8);
++		have = touch_fog_fts_crc(buf, n);
++		if (want == have) {
++			return 0;
++		}
++		err = EIO;
++		touch_wait(1);
 +	}
-+	if (rx[3] & FTS_STATUS_MASK) {
-+		return EIO;
-+	}
-+	memcpy(buf, rx + FTS_OFF, n);
-+	want = (uint16_t)rx[FTS_OFF + n] |
-+	    ((uint16_t)rx[FTS_OFF + n + 1u] << 8);
-+	have = touch_fog_fts_crc(buf, n);
-+	if (want != have) {
-+		return EIO;
-+	}
-+	return 0;
++	return err;
 +}
 +
 +static int
@@ -96,13 +107,12 @@ index 35debbc..f6d1562 100644
 +{
 +	uint8_t tx[96], rx[96];
 +	unsigned len = 4u + FTS_DUMMY + n;
-+	int err;
++	int err = EIO;
 +
 +	if (len > sizeof(tx)) {
 +		return EINVAL;
 +	}
 +	memset(tx, 0, sizeof(tx));
-+	memset(rx, 0, sizeof(rx));
 +	tx[0] = addr;
 +	tx[1] = FTS_CMD_WRITE;
 +	tx[2] = (uint8_t)(n >> 8);
@@ -110,16 +120,24 @@ index 35debbc..f6d1562 100644
 +	if (n) {
 +		memcpy(tx + FTS_OFF, data, n);
 +	}
-+	err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
-+	if (err) {
-+		return err;
++	for (unsigned i = 0; i < FTS_RETRIES; ++i) {
++		memset(rx, 0, sizeof(rx));
++		err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
++		if (!err && !(rx[3] & FTS_STATUS_MASK)) {
++			return 0;
++		}
++		err = err ? err : EIO;
++		touch_wait(1);
 +	}
-+	return (rx[3] & FTS_STATUS_MASK) ? EIO : 0;
++	return err;
 +}
 +
-+/* Chip IDs seen on this family: FT8006S 0x54/0x64, FT3418 0x54, and the
-+ * two IC serials the vendor tree maps (0x1e, 0x22).  Anything else is left
-+ * to the Novatek path. */
++/* The FTS framing validates itself twice: the chip's status byte must have
++ * bits 7 and 5 clear and the payload must match its CRC-16.  No Novatek part
++ * answers that, so a successful read of 0xA3 is the detection.  Our panel
++ * reports 0x86 (the vendor driver prints "IC ID:0x8642", i.e. 0x86 at 0xA3
++ * and 0x42 at 0x9F); 0x54/0x64 appear on other FT8006S builds and 0x1e/0x22
++ * are the two vendor IC serials, so the value is logged but not enforced. */
 +static bool
 +touch_fog_fts_probe(void)
 +{
@@ -127,18 +145,18 @@ index 35debbc..f6d1562 100644
 +	int e1, e2, e3;
 +
 +	e1 = touch_fog_fts_read(FTS_REG_CHIP_ID, &id, 1);
-+	e2 = e1 ? e1 : touch_fog_fts_read(FTS_REG_FW_VER, &fw, 1);
-+	printf("SWEET TOUCH: fog fts chipid=%02x err=%d fw=%02x err=%d\n",
-+	    id, e1, fw, e2);
-+	if (e1 || e2) {
++	if (e1) {
++		printf("SWEET TOUCH: fog fts no answer err=%d\n", e1);
 +		return false;
 +	}
-+	if (id != 0x1eu && id != 0x22u && id != 0x54u && id != 0x64u) {
-+		printf("SWEET TOUCH: fog fts chipid %02x is not focaltech\n", id);
++	e2 = touch_fog_fts_read(FTS_REG_FW_VER, &fw, 1);
++	printf("SWEET TOUCH: fog fts chipid=%02x fw=%02x err=%d\n", id, fw, e2);
++	if (id == 0x00u || id == 0xffu) {
++		printf("SWEET TOUCH: fog fts implausible chipid %02x\n", id);
 +		return false;
 +	}
 +	e3 = touch_fog_fts_write(FTS_REG_POWER, &on, 1);
-+	printf("SWEET TOUCH: fog fts active err=%d fw=%02x\n", e3, fw);
++	printf("SWEET TOUCH: fog fts active err=%d\n", e3);
 +	return true;
 +}
 +
@@ -158,7 +176,15 @@ index 35debbc..f6d1562 100644
 +	if (err) {
 +		return err;
 +	}
++	/* 0xEF in the count byte and the first record means the chip rebooted
++	 * (vendor fts_read_touchdata treats it as a firmware reset). */
++	if (buf[1] == 0xefu && buf[2] == 0xefu && buf[3] == 0xefu) {
++		return EIO;
++	}
 +	points = buf[1] & 0x0fu;
++	if (points > FTS_POINTS) {
++		return EIO;
++	}
 +	if (!st.s_frames || points) {
 +		memcpy(st.s_raw, buf, sizeof(st.s_raw));
 +	}
@@ -200,7 +226,7 @@ index 35debbc..f6d1562 100644
  static bool
  touch_fog_se_init(void)
  {
-@@ -1173,14 +1364,23 @@ touch_fog_run(void)
+@@ -1173,14 +1390,23 @@ touch_fog_run(void)
  	touch_wait(250);
  	st.stage = "fog probe";
  	st.probing = true;
@@ -227,7 +253,7 @@ index 35debbc..f6d1562 100644
  	unsigned errors = 0, ticks = 0, polls = 0;
  	while (!st.dead) {
  		if (st.diag == 3 && ++polls % 500u == 0) {
-@@ -1200,7 +1400,7 @@ touch_fog_run(void)
+@@ -1200,7 +1426,7 @@ touch_fog_run(void)
  		if (!st.irq_hint || st.active ||
  		    !(touch_rd(st.west, TOUCH_GPIO_IO(FOG_PIN_IRQ)) & 1u) ||
  		    (++ticks % 10u) == 0) {
