@@ -40,6 +40,7 @@ done
 
 # build.sh only checks that `xcodes` exists (Xcode is already installed).
 if ! command -v xcodes >/dev/null; then
+	sudo mkdir -p /usr/local/bin
 	printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
 	sudo chmod +x /usr/local/bin/xcodes
 fi
