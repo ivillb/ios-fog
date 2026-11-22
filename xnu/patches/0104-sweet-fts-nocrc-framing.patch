@@ -1,0 +1,151 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 7c8dc57..681d28c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1058,8 +1058,10 @@ touch_fog_report(void)
+ #define FTS_MAX_ID      0x0au
+ #define FTS_STATUS_MASK 0xa0u
+ #define FTS_RETRIES     3u      /* vendor SPI_RETRY_NUMBER */
++#define FTS_CMD_READ_NOCRC 0x80u /* 0x80: payload, no trailing CRC */
+ 
+ static int (*fog_report_fn)(void);
++static bool fts_nocrc;          /* framing the part answered with */
+ 
+ static uint16_t
+ touch_fog_fts_crc(const uint8_t *p, unsigned n)
+@@ -1076,47 +1078,87 @@ touch_fog_fts_crc(const uint8_t *p, unsigned n)
+ 	return crc;
+ }
+ 
++/* One read attempt in the selected framing.  With CRC (0xA0) the chip appends
++ * a CRC-16/KERMIT; without it (0x80) the payload ends the message.  The
++ * vendor driver always asks for CRC, but some FT8006S firmware ignores
++ * DATA_CRC_EN and answers with the payload and no CRC bytes at all - the
++ * status byte still matches, so only the trailing CRC check fails.  The
++ * probe therefore tries CRC first and falls back to 0x80. */
+ static int
+-touch_fog_fts_read(uint8_t addr, uint8_t *buf, unsigned n)
++touch_fog_fts_read_once(uint8_t addr, uint8_t *buf, unsigned n, bool crc,
++    uint8_t *raw, unsigned *rawlen)
+ {
+ 	uint8_t tx[96], rx[96];
+-	unsigned len = 4u + FTS_DUMMY + n + 2u;
+-	int err = EIO;
++	unsigned len = 4u + FTS_DUMMY + n + (crc ? 2u : 0u);
++	uint16_t want, have;
++	int err;
+ 
+ 	if (n == 0 || len > sizeof(tx)) {
+ 		return EINVAL;
+ 	}
+ 	memset(tx, 0, sizeof(tx));
+ 	tx[0] = addr;
+-	tx[1] = FTS_CMD_READ;
++	tx[1] = crc ? FTS_CMD_READ : FTS_CMD_READ_NOCRC;
+ 	tx[2] = (uint8_t)(n >> 8);
+ 	tx[3] = (uint8_t)n;
++	memset(rx, 0, sizeof(rx));
++	err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
++	if (raw) {
++		memcpy(raw, rx, len);
++		*rawlen = len;
++	}
++	if (err) {
++		return err;
++	}
++	if (rx[3] & FTS_STATUS_MASK) {
++		return EIO;
++	}
++	memcpy(buf, rx + FTS_OFF, n);
++	if (!crc) {
++		return 0;
++	}
++	want = (uint16_t)rx[FTS_OFF + n] |
++	    ((uint16_t)rx[FTS_OFF + n + 1u] << 8);
++	have = touch_fog_fts_crc(buf, n);
++	return (want == have) ? 0 : EIO;
++}
++
++static unsigned fts_dumps;
++
++static void
++touch_fog_fts_dump(uint8_t addr, bool crc, int err, const uint8_t *raw,
++    unsigned rawlen)
++{
++	if (st.diag < 3 || fts_dumps >= 4u) {
++		return;
++	}
++	fts_dumps++;
++	printf("SWEET TOUCH: fog fts raw addr=%#x crc=%d err=%d st=%#x:", addr,
++	    crc, err, rawlen > 3u ? raw[3] : 0);
++	for (unsigned i = 0; i < rawlen && i < 20u; ++i) {
++		printf(" %02x", raw[i]);
++	}
++	printf("\n");
++}
++
++static int
++touch_fog_fts_read(uint8_t addr, uint8_t *buf, unsigned n)
++{
++	uint8_t raw[96] = {0};
++	unsigned rawlen = 0;
++	int err = EIO;
++
+ 	/* The vendor driver retries SPI_RETRY_NUMBER times: a frame can be
+ 	 * dropped right after reset and the status/CRC check catches it. */
+ 	for (unsigned i = 0; i < FTS_RETRIES; ++i) {
+-		uint16_t want, have;
+-
+-		memset(rx, 0, sizeof(rx));
+-		err = touch_spi_run(SPI_TX_RX, 0, tx, len, rx, len);
+-		if (err) {
+-			touch_wait(1);
+-			continue;
+-		}
+-		if (rx[3] & FTS_STATUS_MASK) {
+-			err = EIO;
+-			touch_wait(1);
+-			continue;
+-		}
+-		memcpy(buf, rx + FTS_OFF, n);
+-		want = (uint16_t)rx[FTS_OFF + n] |
+-		    ((uint16_t)rx[FTS_OFF + n + 1u] << 8);
+-		have = touch_fog_fts_crc(buf, n);
+-		if (want == have) {
++		err = touch_fog_fts_read_once(addr, buf, n, !fts_nocrc, raw,
++		    &rawlen);
++		if (!err) {
+ 			return 0;
+ 		}
+-		err = EIO;
+ 		touch_wait(1);
+ 	}
++	touch_fog_fts_dump(addr, !fts_nocrc, err, raw, rawlen);
+ 	return err;
+ }
+ 
+@@ -1164,11 +1206,21 @@ touch_fog_fts_probe(void)
+ 
+ 	e1 = touch_fog_fts_read(FTS_REG_CHIP_ID, &id, 1);
+ 	if (e1) {
+-		printf("SWEET TOUCH: fog fts no answer err=%d\n", e1);
+-		return false;
++		printf("SWEET TOUCH: fog fts no answer err=%d crc=1\n", e1);
++		/* A part that ignores DATA_CRC_EN answers the payload and no
++		 * CRC, so only the CRC check fails.  Retry with 0x80 before
++		 * giving up: a wrong framing would fail on the status byte. */
++		fts_nocrc = true;
++		e1 = touch_fog_fts_read(FTS_REG_CHIP_ID, &id, 1);
++		if (e1) {
++			printf("SWEET TOUCH: fog fts no answer err=%d crc=0\n", e1);
++			fts_nocrc = false;
++			return false;
++		}
+ 	}
+ 	e2 = touch_fog_fts_read(FTS_REG_FW_VER, &fw, 1);
+-	printf("SWEET TOUCH: fog fts chipid=%02x fw=%02x err=%d\n", id, fw, e2);
++	printf("SWEET TOUCH: fog fts chipid=%02x fw=%02x err=%d crc=%d\n", id,
++	    fw, e2, fts_nocrc ? 0 : 1);
+ 	if (id == 0x00u || id == 0xffu) {
+ 		printf("SWEET TOUCH: fog fts implausible chipid %02x\n", id);
+ 		return false;
